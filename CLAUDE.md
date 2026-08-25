@@ -1,229 +1,202 @@
 # CLAUDE.md
 
+This file is a deep-dive technical reference for PoliticalTweetCategorizer, not a short ops manual. It is meant to survive being read cold, by someone prepping for a system-design interview about this exact project, or by a future coding session that needs to answer a hard follow-up question without re-reading the whole repo. Built 2026-08-25. Files read to build it: `clean_data.py`, `classify_llm.py`, `evaluate.py`, `prompts.py`, `README.md`, `README_sean.md`, `requirements_junda.txt`, `requirements_sean.txt`, `.gitignore`, the prior `CLAUDE.md`, `resume_bullets.md`, and the three checked-in output CSVs (`llm_results_zero_shot.csv`, `llm_results_few_shot.csv`, `failure_analysis.csv`). `balanced_test_sample.csv` and `cleaned_all_data.parquet` are gitignored and were not present on disk at build time, so their contents are described only from what the code that produces them shows, not from direct inspection. `evaluate.py` was actually executed against the checked-in result CSVs to verify every accuracy number in Section 12, on Python 3.12.3.
+
 ## 0. Update rule
 
-Keep future updates short. Use this format when you change this file.
+Keep future updates short: no debugging narratives, no "we first thought X then found Y" — just the conclusion and the current state. One line per entry, in this exact format:
 
-[Module name] Update reason: one short line. Changes: 1. 2. 3.
+`[Module name] Reason: short explanation. Changes: 1. 2. 3.`
 
-Do not leave old task logs or debug notes in this file. Delete them once the task is done.
+保持更新简短：不要写调试过程，不要写"一开始以为是X后来发现是Y"，只写结论和当前状态。格式如下：
+
+`[模块名] 原因：一句话说明。变更：1. 2. 3.`
+
+Do not leave old task logs or debug notes in this file — delete them once the task is done. Once Section 13's update log passes roughly 15 entries, fold the older ones into whichever numbered section they actually describe, and keep only the recent entries as a running log.
 
 ## 1. What this project is
 
-This is a school project for an intro AI course at RPI. The goal is to label tweets written by US politicians. Each tweet gets two labels. The first label is political leaning, either Democrat or Republican. The second label is stance, either Populist or Establishment. Only the leaning label has ground truth in the source dataset. The stance label is a qualitative output from the model, added to satisfy a rubric requirement about a semantic layer.
+This is a two-person intro AI course project at RPI. It labels tweets written by US politicians along two axes. The first axis, political leaning (Democrat or Republican), has ground truth in the source dataset's `party` column, so it can be scored directly. The second axis, stance (Populist or Establishment), has no ground truth anywhere — it exists only because the course rubric required a semantic layer beyond one binary label, and it is evaluated qualitatively, never scored. Junda built the data cleaning and stratified sampling pipeline (`clean_data.py`); Sean built the LLM classification and evaluation pipeline (`classify_llm.py`, `evaluate.py`, `prompts.py`). The two halves hand off through two files on disk, `balanced_test_sample.csv` (the 250-row gold test set) and `cleaned_all_data.parquet` (everything else, used as the few-shot example pool). There is no server, no API layer, and no database. It is a three-script batch pipeline you run from the command line: build the data, call the Anthropic API once per tweet, print accuracy.
 
-Two people worked on this. Junda built the data cleaning and sampling pipeline. Sean built the LLM classification and evaluation pipeline. The two halves connect through two files on disk: `balanced_test_sample.csv` and `cleaned_all_data.parquet`.
-
-There is no server, no API layer, and no database in this project. It is a batch script that you run from the command line. It reads a dataset, calls the Anthropic API once per tweet, writes CSV files, and prints accuracy numbers.
+The single biggest architectural decision in this codebase is that **the test set is stratified by party and by a hand-picked adversarial subset, not drawn as a plain random sample.** The raw dataset is skewed almost to the point of uselessness for a naive sample — 2021 alone is 96,443 of 179,267 rows (about 53.8%), and 2016–2020 combined is only about 1,300 rows (about 0.7%). A random 250-row sample would be nearly all Biden-era data and would say nothing about whether the classifier generalizes across time or across the hardest, cross-party-rhetoric politicians. Almost every other non-obvious choice in this repo is downstream of that one decision: the 8 hardcoded edge-case usernames exist so there is a deliberately adversarial slice to evaluate against; the exclusion of those same usernames from the few-shot pool exists so that adversarial slice cannot leak into the examples the model is shown; the subgroup breakdowns in `evaluate.py` (by party, by era, by edge-case flag, by individual edge-case senator) exist because the sampling design promised a subgroup story and the evaluation has to deliver on it; and the era-level caveat printed in `evaluate.py` exists because even after stratifying by party, the *test set itself* still comes out roughly 99% Biden-era (see Section 12 for the actual measured split), since era was never a stratification axis — only party and edge-case status were.
 
 整个共同项目的内容双方都可以在求职/面试中作为自己的项目经历来讲。
 
-## 2. Repo file tree
+## 2. Main execution path
+
+There is no request/response cycle in this project — the "execution path" is a batch pipeline invoked from the shell, run once (or a handful of times while tuning). It has one shared trunk (`clean_data.py`) and then splits into two prompting modes inside `classify_llm.py` that share almost all of their machinery.
+
+### 2a. Trunk: `clean_data.py` → `classify_llm.py` → `evaluate.py`
+
+`clean_data.py`'s `run_pipeline()` is the entry point (`if __name__ == "__main__"`). It reads `hf://datasets/Jacobvs/PoliticalTweets/formatted_data.parquet` directly from the HuggingFace hub via `pd.read_parquet`, no local caching step of its own. `load_and_clean_tweets()` runs first: it drops rows with nulls in `text`, `party`, `labels`, `username`, or `date` (`dropna(subset=[...])`), drops duplicate rows by exact `text` match (`drop_duplicates(subset=["text"])`), then in sequence strips URLs (`https?://\S+|www\.\S+` → `""`), unescapes `&amp;` → `&`, strips `@mentions` (`@\S+` → `""`), and strips whitespace — all via `pd.Series.str.replace` with `regex=True`, no tokenizer library involved anywhere. It then drops any row whose whitespace-split word count is under 10, resets the index, and assigns a fresh sequential `id` column (`df["id"] = df.index`) that exists purely so the test/train split can be computed by identity later. `engineer_features_and_flags()` runs next: it parses `year` out of `date` via `pd.to_datetime(...).dt.year`, buckets it into `era` with `np.select` over three ranges (`trump-era-early` 2016–2017, `trump-era-late` 2018–2020, `biden-era` 2021–2023, with an `"other-era"` default that the code comment notes should be empty given the dataset's actual year range), and flags 8 hardcoded usernames into a boolean `is_edge_case` column via `df["username"].isin(confirmed_edge_users)`. `sample_balanced_test_set(df, random_state=42)` runs last: it draws `normal_dem_pool.sample(100, random_state=42)` and `normal_rep_pool.sample(100, random_state=42)` from the non-edge-case rows per party, then `min(25, len(pool))` edge-case rows per party from `edge_dem_pool`/`edge_rep_pool` (also seeded 42, `replace=False`), concatenates all four samples, and shuffles the combined 250(-ish) rows with `.sample(frac=1, random_state=42)`. The remaining pool is computed as `df[~df["id"].isin(balanced_test_sample["id"])]` — an anti-join by the synthetic `id`, which is why that column exists at all — and the temporary `id` column is dropped from both outputs before they are persisted: `balanced_test_sample.to_csv("balanced_test_sample.csv", index=False)` and `df_remaining.to_parquet("cleaned_all_data.parquet")`. There is no timeout anywhere in this script; it is pure in-memory pandas work bounded only by how long the HuggingFace parquet read takes.
+
+`classify_llm.py`'s `main()` picks up from there. It parses `--dry-run` and `--mode {zero_shot,few_shot,both}` (default `both`), reads `ANTHROPIC_API_KEY` from the environment and raises `EnvironmentError` immediately if it is missing (an eager check, before any file I/O), constructs `anthropic.Anthropic(api_key=api_key)`, then loads `balanced_test_sample.csv` (truncated to the first `DRY_RUN_LIMIT = 10` rows via `.head(10)` if `--dry-run` is set) and, only if the mode requires few-shot, loads `cleaned_all_data.parquet`. For each requested mode it calls `run_classification()`, which iterates `test_df.iterrows()` **strictly sequentially** — no `ThreadPoolExecutor`, no `asyncio`, nothing concurrent (see Section 3 for why) — building a prompt per row via `prompts.py`, calling `call_api()`, appending the result dict to a Python list, and sleeping `time.sleep(0.5)` after every single call regardless of success or failure. Every 10 rows (and on the last row) it prints a running accuracy line computed by re-zipping the results list against `test_df.iterrows()` — a second full iteration purely for a progress readout, not used for control flow. After the loop, `results_df = pd.DataFrame(results)` is concatenated onto the original test frame **by position**, not by any join key: `pd.concat([test_df.reset_index(drop=True), results_df], axis=1)`. This is only safe because the loop above visits rows in the same fixed order it started with; there is no explicit row-identity key linking a result back to the row that produced it. Each mode's combined frame is written straight to `llm_results_zero_shot.csv` / `llm_results_few_shot.csv` via `to_csv(index=False)`.
+
+`evaluate.py`'s `main()` closes the trunk. It parses an optional `--file` flag (evaluate one CSV) versus the default of loading both `llm_results_zero_shot.csv` and `llm_results_few_shot.csv` into a `loaded` dict, skipping any file that raises `FileNotFoundError` and printing a warning rather than crashing. For every loaded frame it back-fills a missing `parse_error` column with `False` for backward compatibility with older runs, then hands it to `analyze()`, which in strict order: counts and prints parse errors, computes overall `accuracy()` (parse-error rows filtered out entirely, not scored as wrong), then five more grouped breakdowns — by `party`, by `era` (with a printed statistical-power caveat), normal-vs-edge-case, per individual edge-case `username`, and by confidence bucket — and finally slices out every row where `pred_leaning != party` as `failures`. If more than one file loaded, `comparison_table()` prints a zero-shot-vs-few-shot summary. All `failures` frames across modes get a `mode` column stamped on and are concatenated (`pd.concat(..., ignore_index=True)`) into `failure_analysis.csv`. Nothing here has a timeout; it is single-pass pandas aggregation over at most 250 rows per file.
+
+```
+HuggingFace parquet (hf://datasets/Jacobvs/PoliticalTweets/...)
+        |
+        v
++-------------------------------+
+| clean_data.py :: run_pipeline |
+|  load_and_clean_tweets()      |  dropna -> dedupe -> regex clean -> len>=10 filter -> id=index
+|  engineer_features_and_flags()|  year -> era bucket -> is_edge_case flag (8 hardcoded usernames)
+|  sample_balanced_test_set()   |  100+100 normal (seed 42) + up to 25+25 edge (seed 42) -> shuffle
++-------------------------------+
+        |                              |
+        v                              v
+balanced_test_sample.csv     cleaned_all_data.parquet
+ (250 rows, gold test set)    (remaining pool, few-shot source)
+        |                              |
+        +---------------+--------------+
+                         v
+        +-------------------------------------+
+        |     classify_llm.py :: main()        |
+        |  ANTHROPIC_API_KEY check (eager)      |
+        |  for mode in [zero_shot, few_shot]:   |
+        |    for each of 250 rows, IN ORDER:    |
+        |      build prompt (prompts.py)        |
+        |      call_api() -> retry logic        |
+        |      sleep(0.5s)                      |
+        |    pd.concat(test_df, results, axis=1)| <- positional join, order-dependent
+        +-------------------------------------+
+                 |                    |
+                 v                    v
+  llm_results_zero_shot.csv   llm_results_few_shot.csv
+                 |                    |
+                 +---------+----------+
+                           v
+              +---------------------------+
+              |   evaluate.py :: main()   |
+              |  drop parse_error rows    |
+              |  accuracy + 5 subgroup    |
+              |    breakdowns             |
+              |  zero vs few comparison   |
+              |  collect all failures     |
+              +---------------------------+
+                           |
+                           v
+                failure_analysis.csv
+```
+
+### 2b. Second flow: zero-shot vs. few-shot classification
+
+Both prompting modes run through the exact same `run_classification()` loop and the exact same `call_api()` retry/backoff machinery in `classify_llm.py` — that part is fully shared. What differs is entirely inside `prompts.py`. Zero-shot calls `build_zero_shot_prompt(tweet_text)`, which returns nothing more than `f"Classify this tweet:\n\n{tweet_text}"` — no examples, no extra context. Few-shot calls `build_few_shot_prompt(tweet_text, examples_df)`, which first calls `build_few_shot_examples(examples_df, n_per_party=3)`: this filters `examples_df` down to `~examples_df["is_edge_case"]` (the data-leakage guard), samples 3 Democrat and 3 Republican rows with a fixed `random_state=99`, shuffles the combined 6 with the same seed, and formats them as `"Example N:\n  Tweet: ...\n  Correct label: ...\n"` blocks, followed by `"Now classify the following tweet using the same format:"`. That block is prepended to the same tweet text used in zero-shot. Few-shot mode additionally requires `cleaned_all_data.parquet` to be loaded in `classify_llm.py`'s `main()`; zero-shot mode never touches that file. Neither mode shares any prompt text otherwise — the `SYSTEM_PROMPT` sent via the `system=` parameter is identical between the two modes (see Section 4), only the user-turn content differs.
+
+## 3. Tech choices you will get pressed on
+
+**Why a plain sequential `for` loop instead of threads or async for 500 API calls.** This is the single most interview-baited choice in the codebase, and the honest answer traces to three things actually visible in the code, not a general concurrency platitude. First, this is a one-shot batch script for a class assignment (`if __name__ == "__main__": main()`), not a service under a latency SLA — there is nothing being hidden behind concurrency because nothing is waiting on this process except the person running it. Second, the free tier of the Anthropic API has a requests-per-minute cap, and `time.sleep(0.5)` after every call plus the linear-backoff retry in `call_api()` is the entire rate-limit strategy; firing requests concurrently would risk tripping that cap and burning retries faster than the backoff can recover from. Third, and this is the part that would actually break if you "fixed" it naively: `run_classification()` builds its results as a plain Python list appended to in loop order, then joins it back onto `test_df` by raw position — `pd.concat([test_df.reset_index(drop=True), results_df], axis=1)` — with no explicit row key. Parallelizing the loop without first rewriting that join to track an explicit identity (e.g. carrying the row's `id` or index through each future/task) would silently scramble which prediction lands on which tweet. `ThreadPoolExecutor` would have fixed wall-clock time (250 sequential calls at ~0.5s+latency each is a real, felt cost) but would not have fixed the rate-limit exposure by itself, and would have required that join rewrite as a prerequisite, not an afterthought — for a script meant to run once or twice total. That cost/benefit is why it was never done.
+
+**Why strict JSON-only output with no fallback text parser.** `call_api()` calls `json.loads(raw_text)` with exactly one piece of pre-processing (stripping a leading/trailing ` ``` ` code fence if the model adds one) and no regex-based extraction fallback if that fails. This is a real, observed trade-off, not a hypothetical one: the single parse failure in the checked-in `llm_results_zero_shot.csv` (row for `SenTomCotton`) happened because the model's `reasoning` string contained unescaped literal double quotes around the phrase "dire consequences" inside the JSON string value, which is exactly the class of failure a regex fallback could plausibly have recovered from. The code does not attempt that recovery. The reasoning, stated directly in the code's own comments and consistent with what `evaluate.py` does with the result, is that a fallback parser would make failures silently inconsistent — sometimes recovering a broken response, sometimes not, in a way that is hard to characterize — whereas the current approach makes every parse failure explicit and countable (`parse_error = True`, excluded from `accuracy()`, never scored as wrong). The cost of this choice is a nonzero, uncorrected failure rate: 1 out of 250 rows in the zero-shot run (0.4%), 0 out of 250 in the few-shot run, both measured directly (Section 12).
+
+**Why the edge-case list is a hardcoded set of 8 usernames instead of a computed feature.** `engineer_features_and_flags()` flags `{'SenatorRomney', 'SenatorCollins', 'lisamurkowski', 'HawleyMO', 'SenSherrodBrown', 'Sen_JoeManchin', 'SenSanders', 'SenAngusKing'}` by literal set membership on `username`. There is no vote-record feature, no cross-party-rhetoric score, no clustering step in this dataset that could derive "crosses party lines" from the columns that exist (`text`, `party`, `labels`, `username`, `date`). It is a judgment call about real-world political reputation, made once by a human and then applied as a lookup, not a model output. The cost is stated plainly in Section 9: this list has no staleness check built in, so if the underlying HuggingFace dataset's roster changes, nothing in the code will surface that the list needs revisiting.
+
+**Why flat CSV/parquet files instead of a database.** There is no database anywhere in this project, and no code path was found that would need one. The full pipeline processes at most 179,267 rows once, in memory, in a single Python process, and the only "queries" that exist are `pandas.groupby` calls over frames that are at most 250 rows by the time they reach `evaluate.py`. A database would add a persistence layer, a schema-migration surface, and a dependency that nothing here is bottlenecked on — the actual bottleneck in this system is the 500 sequential network calls to the Anthropic API in `classify_llm.py`, not query throughput or storage volume. `pd.read_parquet`/`to_csv`/`to_parquet` are the entire persistence layer, and each script's I/O is a full-file read or full-file write, never a partial update.
+
+## 4. Interface reference: the three CLI entry points
+
+**`python clean_data.py`** (`clean_data.py:run_pipeline`, invoked only via `if __name__ == "__main__"`, no CLI flags at all — `argparse` is not used in this file). Input: a hardcoded HuggingFace URI, `hf://datasets/Jacobvs/PoliticalTweets/formatted_data.parquet` (`clean_data.py:191`), no override mechanism exists. Output: always both `balanced_test_sample.csv` and `cleaned_all_data.parquet`, unconditionally, in that fixed order (`clean_data.py:199-200`) — there is no way to run only part of this script from the command line. Failure paths: none are explicitly handled; a missing/unreachable HuggingFace dataset, or a `.sample(100, ...)` call against a pool with fewer than 100 rows in one party, would raise an uncaught pandas/`huggingface_hub` exception and crash the process. This is not defensive code and was not written to be.
+
+**`python classify_llm.py [--dry-run] [--mode {zero_shot,few_shot,both}]`** (`classify_llm.py:main`). `--dry-run` is a boolean flag (`action="store_true"`) that truncates the loaded test set to `test_df.head(DRY_RUN_LIMIT)` where `DRY_RUN_LIMIT = 10`; `--mode` defaults to `"both"`. Operation order matters and cannot be reversed: the `ANTHROPIC_API_KEY` environment check happens *before* any file is read (`classify_llm.py:190-195`), specifically so a missing key fails in under a second instead of after `balanced_test_sample.csv` and possibly the multi-hundred-thousand-row `cleaned_all_data.parquet` have already been loaded into memory. Within `call_api(client, user_message)` (`classify_llm.py:54`), the three `except` clauses are checked in this fixed order and that order is load-bearing: `json.JSONDecodeError` first, returns immediately with `parse_error=True` and **no retry** (a content problem, not a timing one — retrying does not change what the model already said); `anthropic.RateLimitError` second, retries with backoff `RETRY_DELAY * attempt` seconds (5s, 10s, 15s for attempts 1–3); `anthropic.APIError` last, as the general/transient-network case, retries with a fixed 5s wait. `RETRY_LIMIT = 3`; if all three attempts are exhausted the row is returned as `pred_leaning="API_ERROR"`, `pred_stance="API_ERROR"`, `confidence=-1`, `reasoning="All retries failed"`, `parse_error=True` — API_ERROR rows are excluded from accuracy exactly the same way parse errors are, since `evaluate.py` only checks the `parse_error` boolean, not the string value in `pred_leaning`. Response shape from the model, before parsing, is expected to be exactly the JSON object defined in `SYSTEM_PROMPT` (Section 5); after parsing, `call_api()` returns a dict with keys `pred_leaning`, `pred_stance`, `confidence`, `reasoning`, `raw_response`, `parse_error` — using `parsed.get(key, default)` for each field, so a JSON response that parses successfully but is missing an expected key (e.g. no `"confidence"` field) degrades to a default value (`-1` for confidence, `"PARSE_ERROR"` for the label fields, `""` for reasoning) rather than raising. Output: `llm_results_zero_shot.csv` and/or `llm_results_few_shot.csv`, written unconditionally at the end of each requested mode's loop (`classify_llm.py:220,225`), overwriting any existing file of the same name with no confirmation prompt.
+
+**`python evaluate.py [--file PATH]`** (`evaluate.py:main`). With no `--file`, evaluates both `llm_results_zero_shot.csv` and `llm_results_few_shot.csv` by fixed filename; with `--file`, evaluates exactly one arbitrary path instead, under the same label as the path itself. A `FileNotFoundError` on either default file is caught and printed as a warning, not a crash (`evaluate.py:221-222`) — this is the only try/except in the entire evaluation script. If neither default file is found, the script prints "No result files found." and returns cleanly rather than raising. Backward-compatibility handling happens before any analysis: if a loaded frame lacks a `parse_error` column at all, one is added and filled `False` (`evaluate.py:217-219`), so older result files (from before `parse_error` existed) are treated as having zero failures rather than crashing on a missing-column KeyError later. Output: printed sections to stdout (see Section 5 for their content and order) plus one unconditional file write, `failure_analysis.csv`, built by concatenating every mode's `failures` frame with a `mode` column stamped on (`evaluate.py:230,238-239`) — this file is also overwritten with no confirmation prompt every time `evaluate.py` runs.
+
+## 5. Evaluation methodology deep-dive, `evaluate.py`
+
+`accuracy(df)` is the single source of truth for the headline number: filter to `~df["parse_error"]`, then `(valid["pred_leaning"] == valid["party"]).sum() / len(valid)`, returning `0.0` on an empty frame rather than dividing by zero. `accuracy_by_group(df, group_col)` is the one function behind every subgroup breakdown in this project — by party, by era, and by individual edge-case username are all just this same function called with a different `group_col` string, sorted descending by accuracy. This is a deliberate pandas-style choice over writing three or four near-duplicate blocks, not a query-optimization concern, since there is no database or query planner involved anywhere. `analyze(df, label)` runs the sections in a fixed printed order — parse-error count, overall accuracy, by-party, by-era (with a hardcoded caveat string about biden-era being ~99% of the data and cross-era comparisons having low statistical power), normal-vs-edge-case, per-edge-case-username, confidence calibration, then the first 5 raw failure rows — and returns the full `failures` frame (every row where `pred_leaning != party`, restricted to non-parse-error rows) so `main()` can accumulate it across both modes. Confidence calibration uses five fixed, non-configurable bucket boundaries defined inline as a list of tuples, `[(0,50), (50,70), (70,85), (85,95), (95,101)]`, with each bucket computed as `confidence >= lo and confidence < hi` — the `101` upper bound on the last bucket exists so a confidence of exactly 100 is still captured by `< 101`. `comparison_table()` only runs if more than one result file was loaded, and recomputes overall/normal/edge accuracy from scratch per mode rather than reusing anything from `analyze()`'s return value — the two code paths are independent, so a bug in one would not necessarily show up in the other's numbers.
+
+## 6. Data layer
+
+There is no database; every "table" is a CSV or parquet file, and this section documents them as such.
+
+`balanced_test_sample.csv` (gitignored, not present on disk at build time; schema confirmed indirectly from `classify_llm.py`'s consumption of it and from the shared prefix columns visible in the checked-in result CSVs): `text, party, labels, username, date, year, era, is_edge_case`, 250 rows, with `party` (`Democrat`/`Republican`) as the only ground-truth label and `labels` (`0`/`1`) as its numeric-coded twin — both present, never reconciled or deduplicated against each other in the code, so a caller could in principle read the wrong one; `evaluate.py` only ever reads `party`. `cleaned_all_data.parquet` (also gitignored, not present on disk): same schema minus the temporary `id` column, remaining ~179,000-ish rows after the 250-row test set is removed by anti-join on `id`. These two files are not "merged" with each other by design — they are deliberately disjoint partitions of one cleaned dataset, split specifically so the few-shot pool can never contain a tweet that is also in the gold evaluation set.
+
+`llm_results_zero_shot.csv` and `llm_results_few_shot.csv` (both checked into git, both confirmed by direct read: 250 data rows each, verified via `pandas.read_csv` at build time): every column from `balanced_test_sample.csv` plus six appended by `classify_llm.py` — `pred_leaning` (`Democrat`/`Republican`/`PARSE_ERROR`/`API_ERROR`), `pred_stance` (`Populist`/`Establishment`, same failure sentinels), `confidence` (int 0–100, or `-1` on any failure), `reasoning` (model's one-sentence explanation, empty string on failure), `raw_response` (the full raw text returned by the API, kept specifically for debugging bad parses — this is model output, not a credential, and is safe to have on disk), and `parse_error` (bool). `failure_analysis.csv` (checked in, confirmed by direct read, 126 rows as of the last `evaluate.py` run against the current checked-in inputs) is the same schema plus one appended `mode` column (`"zero-shot"`/`"few-shot"`) recording which run each misclassified row came from.
+
+There is no sorting, paging, or filtering logic that lives in a query layer anywhere — every filter (`~df["parse_error"]`, `df["party"] == "Democrat"`, confidence bucket ranges, etc.) is plain in-process pandas boolean indexing over a frame that never exceeds 250 rows by the time `evaluate.py` touches it, and up to ~179,000 rows at the widest point in `clean_data.py`. The failure mode this avoids is nonexistent-in-practice at this scale (there is no query planner to misbehave); the cost accepted instead is that every script re-reads and re-filters full files on every run, which is fine at these row counts and would not be fine at a materially larger scale.
+
+There is no ownership or authorization model in this codebase at all — no user accounts, no multi-tenant data, no create-vs-modify distinction on any record, because there is nothing here for one actor to protect from another. The only credential in the system is `ANTHROPIC_API_KEY`, read once via `os.environ.get("ANTHROPIC_API_KEY")` in `classify_llm.py:190` and passed directly into `anthropic.Anthropic(api_key=api_key)`. It is never written to any file, never included in any of the printed log lines in `classify_llm.py` or `evaluate.py`, and never appears in any of the output CSVs — confirmed by reading every `print(...)` call and every dict written to a results row in `classify_llm.py`. `.gitignore` additionally excludes `.env`, `*.env`, `secrets.toml`, and `config.json` defensively, though none of those files exist in this repo currently and no code reads from them.
+
+Known non-atomic sequences, stated plainly: the positional join in `run_classification()` (`pd.concat([test_df.reset_index(drop=True), results_df], axis=1)`) is an accepted simplification, not a bug, **as long as the loop stays single-threaded and sequential** — it was an explicit design trade documented in the code's own reasoning (Section 3) and would become a real bug the moment anyone parallelizes that loop without first adding an explicit row-identity key. The reuse of `random_state=42` across four separate `.sample()` calls in `sample_balanced_test_set()` (normal-Dem, normal-Rep, edge-Dem, edge-Rep) and again for the final shuffle is not a race condition — the four samples are drawn from four disjoint pools (partitioned by `party` and `is_edge_case` before sampling), so reusing the seed does not cause overlap — but it is worth knowing that the seed value itself is doing double duty as "reproducibility knob" and "arbitrary pool-independent constant," which is a slightly unconventional pattern.
+
+## 7. Directory layout, as it actually exists today
 
 ```
 PoliticalTweetCategorizer/
-  README.md                  one line, project description
-  README_sean.md             setup and usage guide for the LLM half
-  clean_data.py               Junda's pipeline: load, clean, sample, split
-  classify_llm.py              Sean's pipeline: call the API, save predictions
-  evaluate.py                  Sean's pipeline: score predictions, save failures
-  prompts.py                   all prompt text and prompt builder functions
-  requirements_junda.txt      deps for the data cleaning half
-  requirements_sean.txt       just the anthropic package, on top of requirements_junda.txt
-  balanced_test_sample.csv    generated output, gold test set, gitignored
-  llm_results_zero_shot.csv   generated output, checked in
-  llm_results_few_shot.csv    generated output, checked in
-  failure_analysis.csv        generated output, checked in
-  .gitignore
+  CLAUDE.md                    this file — deep-dive technical reference
+  README.md                    one-line project description, committed
+  README_sean.md               setup/usage guide for the LLM half, committed
+  resume_bullets.md            personal resume-bullet drafting notes, committed, not part of the pipeline
+  clean_data.py                Junda's pipeline: load, clean, feature-engineer, stratified-sample, split — committed
+  classify_llm.py              Sean's pipeline: build prompts, call the Anthropic API, retry/backoff, write results — committed
+  evaluate.py                  Sean's pipeline: score predictions, subgroup breakdowns, failure export — committed
+  prompts.py                   all prompt text (incl. one commented-out earlier version) and prompt-builder functions — committed
+  requirements_junda.txt       deps for the data-cleaning half; contains 9 duplicated pinned lines (see Section 9) — committed
+  requirements_sean.txt        adds only `anthropic>=0.25.0` on top of requirements_junda.txt — committed
+  .gitignore                   excludes secrets/credentials, __pycache__, venvs, and the two generated data files below
+  balanced_test_sample.csv     GENERATED, gitignored — the 250-row gold test set; not present in a fresh checkout
+  cleaned_all_data.parquet     GENERATED, gitignored — the few-shot/training pool; not present in a fresh checkout
+  llm_results_zero_shot.csv    GENERATED, but committed anyway — zero-shot predictions over the 250-row test set
+  llm_results_few_shot.csv     GENERATED, but committed anyway — few-shot predictions over the same 250 rows
+  failure_analysis.csv         GENERATED, but committed anyway — every misclassified row from both modes
 ```
 
-Two files are not tracked in git: `balanced_test_sample.csv` and `cleaned_all_data.parquet`. Both come out of `clean_data.py`. If you clone this repo fresh, you must run `clean_data.py` before you can run anything else.
+Nothing in this repo is "deployed" in any conventional sense — there is no build artifact, no container, no server process; the entire repo is the deployable unit and running it means running the three scripts locally. `resume_bullets.md` is explicitly personal drafting material, not project documentation, and should not be treated as a source of truth about the code (it is, however, independently verified against the code in Section 12 of this file). The three result CSVs are unusual in that they are pipeline *outputs* that are nonetheless checked into git rather than gitignored, unlike the two upstream data files — this means the repo carries a specific point-in-time snapshot of one run's results, and re-running `classify_llm.py` will silently overwrite that snapshot with a new (LLM-nondeterministic) one unless the committed versions are deliberately preserved first.
 
-## 3. Full pipeline flow
+## 8. Business rules, condensed
 
-The pipeline runs in one straight line. There is no branching, no parallel path, and no async step anywhere in this project.
+The 8 hardcoded edge-case usernames (`SenatorRomney`, `SenatorCollins`, `lisamurkowski`, `HawleyMO`, `SenSherrodBrown`, `Sen_JoeManchin`, `SenSanders`, `SenAngusKing`) drive three separate, mutually-dependent invariants that must move together: they are assigned in `clean_data.py:engineer_features_and_flags` as `is_edge_case`; that same flag is used in `clean_data.py:sample_balanced_test_set` to carve out up to 25+25 rows into the gold test set, capped by `min(25, len(pool))` per party (so the actual test set can be smaller than 250 if either party's edge-case pool is short — the code prints a warning but does not fail); the identical flag is used in `prompts.py:build_few_shot_examples` to *exclude* those same rows from the few-shot sampling pool, specifically to prevent atypical-of-their-party examples from teaching the model the wrong pattern; and it is used a third time in `evaluate.py` to report edge-case accuracy separately from normal-case accuracy, both overall and per individual username. Any change to that username set must be reflected consistently across all three consumers or the "adversarial subset" story breaks silently. Separately, `parse_error=True` rows are excluded from every accuracy computation everywhere in `evaluate.py` — they are never counted as wrong, on the stated principle that a broken output format is not evidence of a wrong political-leaning guess — and this same exclusion rule is applied identically in `accuracy()`, `accuracy_by_group()`, `comparison_table()`, and the failures slice, so a parse-error row never appears as a "failure" either, only as a separately-reported count. The `confidence` field is a diagnostic signal only, checked in `evaluate.py`'s calibration section, and is never used anywhere to accept, reject, or reweight a prediction — a low-confidence prediction and a high-confidence prediction are scored identically. `API_ERROR` and `PARSE_ERROR` sentinel strings both set `parse_error=True` and `confidence=-1` and are treated identically downstream — `evaluate.py` never distinguishes between "the model's text didn't parse" and "all three retries were exhausted," both just become one excluded row.
 
-```
-HuggingFace dataset (raw)
-  hf://datasets/Jacobvs/PoliticalTweets/formatted_data.parquet
-        |
-        v
-clean_data.py
-  1. load_and_clean_tweets()
-     - drop rows missing text, party, labels, username, or date
-     - drop duplicate tweet text
-     - strip URLs, strip @mentions, unescape &amp;, trim whitespace
-     - drop tweets under 10 words
-     - assign a fresh sequential id
-  2. engineer_features_and_flags()
-     - pull year from date
-     - bucket year into era: trump-era-early (2016-2017),
-       trump-era-late (2018-2020), biden-era (2021-2023)
-     - flag 8 hardcoded usernames as edge cases
-  3. sample_balanced_test_set()
-     - sample 100 Democrat + 100 Republican normal tweets
-     - sample up to 25 Democrat + 25 Republican edge case tweets
-     - shuffle and combine into one 250 row test set
-     - everything not sampled becomes the remaining pool
-        |
-        +--> balanced_test_sample.csv   (250 rows, gold test set)
-        +--> cleaned_all_data.parquet   (everything else, few-shot pool)
-        |
-        v
-classify_llm.py
-  - load both files above
-  - for mode in [zero_shot, few_shot]:
-      for each of the 250 test rows, in order:
-        build a prompt with prompts.py
-        call the Anthropic API, one tweet per request
-        sleep 0.5 seconds
-      write one results CSV for this mode
-        |
-        +--> llm_results_zero_shot.csv
-        +--> llm_results_few_shot.csv
-        |
-        v
-evaluate.py
-  - drop rows where parse_error is True
-  - print overall accuracy
-  - print accuracy grouped by party, by era, by edge case flag,
-    by individual edge case username, and by confidence bucket
-  - print a zero-shot vs few-shot comparison table
-  - collect every wrong prediction from both modes
-        |
-        v
-failure_analysis.csv
-```
+## 9. Known risks, still open
 
-There is also a small text-to-report step that is manual: whoever writes the final report reads `failure_analysis.csv` by hand and picks examples.
+The test set is 250 rows, and no confidence interval is computed or reported anywhere in `evaluate.py` — the accuracy numbers in Section 12 have real sampling variance that this codebase does not quantify. The real fix would be a bootstrap or a binomial confidence interval added alongside each printed accuracy line in `evaluate.py`.
 
-## 4. Data cleaning and sampling, `clean_data.py`
+The stance dimension (Populist vs. Establishment) has zero ground truth in the source dataset (discussed in Sections 1 and 5); no accuracy claim about it is possible with this data, and the only way to say anything about it is a qualitative read of the `pred_stance` and `reasoning` columns by a human.
 
-### Why regex cleaning instead of a tokenizer library
+`README_sean.md` names a BERT baseline as a possible comparison point; no BERT baseline code exists anywhere in this repo — confirmed by the file listing in Section 7. If a design-interview question assumes one exists, the honest answer is that it does not.
 
-The text cleaning step strips URLs, strips @mentions, and unescapes `&amp;`, all with plain regex. There is no dedicated tokenizer or normalization library involved. The reason is that the LLM reads raw text directly. It does not need pre-tokenized input the way a BERT style model would. The cleaning here only removes noise that would waste tokens or confuse the classifier, like a raw URL or a mention handle that leaks the tweet's author.
+The dataset and code both describe this as senator data (`clean_data.py`'s docstring literally says "senator tracking id"), but this was directly falsified by reading the checked-in result CSVs: `llm_results_zero_shot.csv` contains rows for `RepLoudermilk`, `RepAndyKimNJ`, `RepCuellar`, `RepGregStanton`, `RepBrownley`, and `RepRubenGallego` — all `Rep`-prefixed House handles, not `Sen`-prefixed Senate ones. This assumption was never verified against the `username` column anywhere in the code.
 
-### Why a 10 word minimum
+`requirements_junda.txt` has 9 exact-duplicate pinned lines, confirmed directly (`sort | uniq -d`): `annotated-types==0.7.0`, `anthropic==0.106.0`, `distro==1.9.0`, `docstring_parser==0.18.0`, `jiter==0.15.0`, `pydantic==2.13.4`, `pydantic_core==2.46.4`, `sniffio==1.3.1`, `typing-inspection==0.4.2`. This does not break `pip install` but is a sign the file was regenerated by appending rather than by a clean freeze.
 
-Tweets under 10 words are dropped. Very short tweets are usually retweets with no added text, or a link with a short caption. They carry weak signal for a leaning classifier and would just add label noise to both the test set and the few-shot pool.
+The hardcoded edge-case username list has no staleness check: nothing in the code will indicate if the underlying HuggingFace dataset's roster of politicians changes such that the list becomes outdated or incomplete.
 
-### Why stratified sampling instead of a random sample
+The strict JSON-only parse contract has a confirmed, nonzero failure rate under real model output: exactly 1 of 500 total calls (0.4% of the zero-shot run) failed because the model embedded unescaped literal quotes inside a JSON string value (the `SenTomCotton` row, Section 3). There is no fallback recovery for this class of failure, by design; the risk accepted is that this failure rate is not zero and is not currently bounded by anything stronger than "the model usually behaves."
 
-The full dataset is badly skewed by year. Over 96,000 tweets come from 2021 alone, and the whole 2016 to 2020 range only has about 1,300 tweets combined. A plain random sample of 250 tweets would be almost entirely biden-era tweets. The stratified approach fixes the party balance directly, 100 Democrat and 100 Republican normal tweets, plus up to 25 Democrat and 25 Republican edge case tweets. This guarantees the test set accuracy number is not just measuring how well the model reads 2021 tweets.
+The positional `pd.concat(..., axis=1)` join in `run_classification()` is safe only because the loop is strictly single-threaded and sequential today; it is not a bug now, but it is a landmine for anyone who parallelizes that loop later without first adding an explicit row-identity key (see Sections 3 and 6).
 
-### Why the edge case list is hardcoded
+## 10. Build, run, test, deploy — quick version
 
-Eight usernames are hardcoded as edge cases: Romney, Collins, Murkowski, Hawley, Sherrod Brown, Manchin, Sanders, and Angus King. These are politicians known for crossing party lines on rhetoric or voting record. The list is hardcoded rather than computed because "crosses party lines" is not something you can derive from the columns in this dataset. It needed a human call, made once, and then applied consistently. The tradeoff is that this list needs manual updating if the politician roster in the source dataset changes.
-
-### Why edge case senators are excluded from the few-shot pool
-
-`prompts.py` filters out `is_edge_case == True` rows before sampling few-shot examples. This is a data leakage guard. An edge case tweet is deliberately not typical of its party. If one showed up as a labeled example in a few-shot prompt, it would teach the model the wrong pattern for what a "typical" Democrat or Republican tweet looks like, and that would hurt generalization on the rest of the test set. This rule is called out explicitly in the code comments and in `README_sean.md` as a warning to whoever edits the few-shot sampling logic.
-
-### A real data quality note worth knowing
-
-The docs and code comments describe the dataset as senator tweets, and `clean_data.py` even calls the id field a senator tracking id. But the underlying data is not strictly senators. `llm_results_few_shot.csv` has rows with usernames like `RepLoudermilk`, which is a House of Representatives handle, not a Senate one. The `Sen` prefix and `Rep` prefix both show up in the username column. If asked about this in a review, the honest answer is that the dataset was assumed to be senators only, and that assumption was never fully verified against the username column.
-
-## 5. Prompt design, `prompts.py`
-
-### Two dimensions, one has ground truth
-
-The system prompt asks for two labels. Leaning (Democrat or Republican) has ground truth in the `party` column, so accuracy can be measured directly. Stance (Populist or Establishment) has no ground truth anywhere in the source dataset. It exists only because the course rubric asked for a semantic layer beyond a single binary label. Evaluation treats stance as a qualitative output. `evaluate.py` never scores it against anything.
-
-### Why the prompt got shorter
-
-`prompts.py` still has an old system prompt commented out at the top of the file. That older version spelled out both dimensions with a few sentences of definition each, plus explicit output rules and a copy paste JSON template. The commit history shows this was cut down in favor of a shorter prompt, in the same commit that switched the model, roughly halving the token count of the instructions. Fewer tokens means faster responses and a lower per call cost across 250 tweets times two modes times however many reruns happen while tuning the prompt. This is a real tradeoff: the shorter prompt is cheaper and faster, but it drops some of the explicit reasoning scaffolding the longer version had.
-
-### Why the model must return only JSON
-
-Every response is parsed with `json.loads()`. There is no fallback text parser, no regex extraction from free text. Forcing strict JSON output keeps `call_api()` simple. It also makes failures explicit and countable, since anything that fails to parse gets marked `parse_error = True` and excluded from accuracy, rather than silently mis-scored.
-
-### Confidence field
-
-The model self reports a confidence score from 0 to 100 on every call. This is not used to accept or reject a prediction. It is only used downstream in `evaluate.py`, bucketed into five ranges, to check whether the model's stated confidence actually correlates with being right. This is a calibration check, not a filtering mechanism.
-
-## 6. API call reliability, `classify_llm.py`
-
-### Exception handling order and why it is ordered this way
-
-`call_api()` catches three kinds of failure, in this order.
-
-`json.JSONDecodeError` is caught first and returns immediately with `parse_error = True`, no retry. If the model returned text that is not valid JSON, retrying the same call is not likely to fix it right away, and burning a retry budget on a formatting problem wastes API calls that cost money.
-
-`anthropic.RateLimitError` is caught second and does retry, with a wait of `RETRY_DELAY * attempt` seconds, so the wait grows with each attempt. This is a linear backoff, not exponential. Rate limit errors are expected to clear once you wait long enough, so retrying makes sense here.
-
-`anthropic.APIError` is caught last as the general case, covering network errors and other transient API problems, and retries with a fixed `RETRY_DELAY` wait.
-
-If asked why JSON errors are not retried but rate limit errors are, the answer is that a JSON parse failure is a content problem, and a rate limit error is a timing problem. Retrying fixes timing problems. It does not fix content problems.
-
-### Why a plain for loop instead of threads or async
-
-All 250 API calls run one at a time in a plain Python for loop, with a `time.sleep(0.5)` between each call. There is no `ThreadPoolExecutor`, no `asyncio`, and no concurrent request batching anywhere in this codebase.
-
-Three real reasons support this. First, this is a one shot batch script for a class assignment, not a live server handling concurrent user traffic. There is no latency requirement to hide behind concurrency. Second, the free tier of the Anthropic API has a request per minute limit, and firing requests concurrently would risk tripping that limit and wasting retries. A sequential loop with a fixed sleep is the simplest way to stay under a known rate limit. Third, the results list is built by appending in loop order and then concatenated back onto the test dataframe with `pd.concat` by position, not by an explicit key. That alignment only works because the loop processes rows in the same order every time. Adding concurrency here would require rewriting the result collection to track row identity explicitly, for a script that only needs to run once or twice total.
-
-### The retry and cost math
-
-`RETRY_LIMIT` is 3 and `RETRY_DELAY` is 5 seconds. A rate limit error on attempt 1 waits 5 seconds, attempt 2 waits 10 seconds, attempt 3 waits 15 seconds, before the call gives up and returns `API_ERROR`. Across a full run of 250 tweets times 2 modes, `README_sean.md` estimates total API cost at roughly 1 to 2 dollars, based on `claude-haiku-4-5` pricing.
-
-## 7. Evaluation methodology, `evaluate.py`
-
-### Parse errors are dropped, not scored as wrong
-
-`accuracy()` filters out `parse_error == True` rows before computing anything. A row where the model's output could not be parsed is not evidence the model got the leaning wrong. It is evidence the output format broke. Counting it as a wrong answer would conflate two different failure modes into one number.
-
-### Why subgroup accuracy uses `groupby` in pandas instead of separate queries
-
-`accuracy_by_group()` takes a column name and returns accuracy per group with `groupby`. This one function covers accuracy by party, by era, and by individual edge case username, just by changing the column argument. There is no SQL here and no database, so this is really a question of pandas style, not query planning. The point worth knowing is that one small function replaced what would otherwise be three or four near duplicate blocks.
-
-### Why the era comparison comes with a caveat printed alongside it
-
-Biden era tweets make up about 99 percent of the dataset. `evaluate.py` prints era level accuracy anyway, but also prints a warning next to it that cross era comparisons have low statistical power. This is intentional. The number is worth showing, but showing it without the caveat would overstate what the comparison actually proves.
-
-### Confidence calibration
-
-Confidence scores are bucketed into five ranges: 0 to 49, 50 to 69, 70 to 84, 85 to 94, and 95 to 100. Accuracy is computed inside each bucket. This checks whether the model's confidence score tracks its actual correctness, not just whether the model was right overall.
-
-### Edge case senators as an adversarial test set
-
-The 8 hardcoded edge case usernames exist specifically because they are the hardest cases for a leaning classifier. Their rhetoric does not follow the typical pattern for their party. `evaluate.py` reports their accuracy separately from the normal cases, and this split is usually where a report finds its most interesting failure mode, since a model that is highly accurate overall can still fail badly on the tweets that were chosen specifically because they are hard.
-
-## 8. Known limitations, worth knowing before a review
-
-The test set is small, 250 tweets. Accuracy numbers at that sample size have real confidence intervals, and the code does not compute or report one.
-
-The stance dimension, Populist versus Establishment, has no ground truth anywhere. Any claim about stance accuracy is not possible with this data. Only qualitative review of the reasoning field is possible.
-
-`README_sean.md` mentions a BERT baseline as a possible comparison point. As of the current code, no BERT baseline exists in this repo. Only the LLM pipeline is implemented.
-
-`requirements_junda.txt` has several duplicate lines, including `anthropic`, `annotated-types`, `distro`, `docstring_parser`, `jiter`, `pydantic`, `pydantic_core`, `sniffio`, and `typing-inspection`, each listed twice with the same pin. This does not break `pip install`, but it is a sign the file was regenerated by appending rather than by a clean freeze.
-
-The edge case username list needs manual maintenance. If the source dataset adds or removes politicians, nothing in the code will tell you the list is stale.
-
-## 9. Setup and running
-
-Install both requirement files. `requirements_sean.txt` only adds the `anthropic` package on top of `requirements_junda.txt`, so both are needed.
-
-```
+```bash
+# setup
 pip install -r requirements_junda.txt
 pip install -r requirements_sean.txt
-export ANTHROPIC_API_KEY="sk-ant-..."
+export ANTHROPIC_API_KEY="sk-ant-..."   # checked eagerly in classify_llm.py, before any file I/O
+
+# run, in this exact order — each step consumes a file the previous step wrote
+python clean_data.py                    # produces balanced_test_sample.csv + cleaned_all_data.parquet (gitignored, regenerated every run)
+python classify_llm.py --dry-run        # first 10 tweets only, ~$0.01, sanity-checks output shape before spending real credits
+python classify_llm.py                  # full 250-tweet x 2-mode run, ~$1-2 total per README_sean.md's own estimate
+python evaluate.py                      # prints accuracy breakdowns, writes failure_analysis.csv
 ```
 
-Run the pipeline in this order. Each step depends on the file the previous step wrote.
+There is no automated test suite anywhere in this repo — no `pytest`, no `unittest`, no `tests/` directory was found. The only pre-flight check available is `classify_llm.py --dry-run`, which is a manual, eyeball-the-output check, not an assertion-based test. `classify_llm.py` also accepts `--mode {zero_shot,few_shot,both}` to run one mode at a time, e.g. `python classify_llm.py --mode zero_shot --dry-run`. `evaluate.py --file <path>` evaluates a single arbitrary CSV instead of the two hardcoded default filenames. The only non-obvious gotcha worth flagging: `ANTHROPIC_API_KEY` is checked eagerly (before `balanced_test_sample.csv` or `cleaned_all_data.parquet` are read) specifically so a missing key fails fast rather than after a potentially large parquet load; there is no equivalent eager check for the two data files themselves, which are only touched lazily when `pd.read_csv`/`pd.read_parquet` is actually called.
 
-```
-python clean_data.py
-python classify_llm.py --dry-run
-python classify_llm.py
-python evaluate.py
-```
+## 11. Rules for extending this project without breaking it
 
-The dry run flag limits classification to the first 10 tweets, so you can check the output format before spending API credits on the full 250 tweet run. `classify_llm.py` also takes a `--mode` flag, `zero_shot`, `few_shot`, or `both`, if you want to run one mode at a time.
+**Adding a new edge-case politician** (the most common realistic extension): add the exact `username` string to the `confirmed_edge_users` set in `clean_data.py:engineer_features_and_flags` (currently 8 entries); re-run `python clean_data.py` to regenerate both `balanced_test_sample.csv` and `cleaned_all_data.parquet` with the new flag applied consistently to sampling and to the few-shot exclusion filter; re-run `python classify_llm.py` (both modes, since the test set composition changed) and `python evaluate.py` to get a consistent new set of results and failure analysis; do not hand-edit the CSV files to add the flag after the fact, since the test-set membership itself would also need to change and that only happens inside `sample_balanced_test_set`.
 
-## 10. Output column reference
+**Adding a new prompting mode** (e.g. a chain-of-thought variant): add a new `build_<mode>_prompt(...)` function to `prompts.py` following the existing signature pattern; add the new mode string to the `choices=[...]` list in `classify_llm.py:main`'s `argparse` setup and to the `if mode == ...` branch in `run_classification()`; add a new `OUTPUT_<MODE>` filename constant near the top of `classify_llm.py` alongside `OUTPUT_ZERO`/`OUTPUT_FEW`; update `evaluate.py`'s default `files = {...}` dict in `main()` if the new mode should be evaluated by default rather than only via `--file`.
 
-Both `llm_results_zero_shot.csv` and `llm_results_few_shot.csv` share the same schema. They start with every column from `balanced_test_sample.csv`, which is `text`, `party`, `labels`, `username`, `date`, `year`, `era`, and `is_edge_case`. Six columns are appended by `classify_llm.py`.
+Do-not list, each naming the exact mechanism it would break: do not remove the `~examples_df["is_edge_case"]` filter inside `prompts.py:build_few_shot_examples` — this is the sole guard against leaking adversarial examples into the few-shot pool, and nothing else in the codebase enforces it. Do not reorder the `except` clauses in `classify_llm.py:call_api` — `json.JSONDecodeError` must stay first and un-retried, `anthropic.RateLimitError` must stay before the general `anthropic.APIError` catch, because `RateLimitError` is a subclass-compatible special case that needs its own backoff formula (`RETRY_DELAY * attempt`) distinct from the flat `RETRY_DELAY` used for generic API errors. Do not parallelize the loop inside `run_classification()` without first replacing the positional `pd.concat(..., axis=1)` join with an explicit key-based merge — this is the landmine flagged in Sections 3, 6, and 9. Do not use `confidence` as a filter or acceptance threshold anywhere — every place it currently appears treats it as a read-only diagnostic, and introducing a threshold would silently change what "250 test rows" means for every downstream accuracy number. Do not drop the `parse_error` backward-compatibility fill (`fillna(False).astype(bool)`) in `evaluate.py:main` — older result files without that column would otherwise raise a `KeyError` deep inside `analyze()` rather than degrading gracefully.
 
-`pred_leaning` holds the model's leaning prediction, Democrat or Republican, or PARSE_ERROR or API_ERROR on failure. `pred_stance` holds the model's stance prediction, Populist or Establishment, with the same failure values. `confidence` holds the model's self reported confidence, 0 to 100, or negative 1 on failure. `reasoning` holds the model's one sentence explanation. `raw_response` holds the full raw text returned by the API, kept for debugging bad parses. `parse_error` is a boolean, true if the response could not be parsed as JSON.
+## 12. Measured performance numbers
 
-`failure_analysis.csv` has the same schema plus one more column, `mode`, marking whether each misclassified row came from the zero-shot or few-shot run.
+These were produced by actually running `python3 evaluate.py` against the checked-in `llm_results_zero_shot.csv` and `llm_results_few_shot.csv` at build time (Python 3.12.3, pandas as pinned in `requirements_junda.txt`). These are point-in-time measurements from an ad hoc script run, not a CI-enforced regression gate — re-running `classify_llm.py` would produce new, non-identical numbers due to LLM nondeterminism, though re-running `evaluate.py` alone against the same, unchanged CSVs is fully deterministic and reproduced these exact figures on a second run with zero diff.
+
+Overall accuracy: zero-shot 72.7% (181/249 valid rows, 1 parse error excluded), few-shot 76.8% (192/250 valid rows, 0 parse errors). By party (zero-shot): Republican 74.2% (92/124), Democrat 71.2% (89/125). Normal vs. edge case: zero-shot normal 74.4% (148/199) vs. edge 66.0% (33/50); few-shot normal 78.0% (156/200) vs. edge 72.0% (36/50) — few-shot beats zero-shot on both slices. Per edge-case senator (zero-shot): SenSanders 100% (8/8), HawleyMO 85.7% (6/7), SenSherrodBrown 83.3% (5/6), Sen_JoeManchin 66.7% (2/3), SenAngusKing 62.5% (5/8), SenatorRomney 50.0% (2/4), lisamurkowski 40.0% (4/10), SenatorCollins 25.0% (1/4) — lisamurkowski and SenatorCollins are the two weakest points in the entire evaluation. Confidence calibration (zero-shot): 0–49 → 56.2% (59/105), 50–69 → 42.9% (3/7, small n), 70–84 → 77.9% (53/68), 85–94 → 94.9% (56/59), 95–100 → 100.0% (10/10) — calibration is broadly monotonic but the 50–69 bucket inverts it on a sample of only 7, which is too small to draw a conclusion from. Era distribution actually realized in the 250-row test set, in both result files identically: 249 biden-era rows, 1 trump-era-late row, 0 trump-era-early rows — confirming that even after stratifying by party and edge-case status, era itself was never a stratification axis, and the test set inherits almost the full severity of the source dataset's ~99% Biden-era skew (this is a directly measured fact, not the same claim as the source-dataset-level skew documented in `clean_data.py`'s docstring). Parse/API errors: 1 `PARSE_ERROR` in zero-shot (0.4%), 0 in few-shot; 0 `API_ERROR` rows in either file.
+
+## 13. Update log
+
+[CLAUDE.md] Reason: full rewrite into a deep-dive reference per updated documentation requirements — every claim re-verified against source and, where possible, against actual script execution. Changes: 1. Restructured into the 13-section format (update rule, project identity, execution path incl. the zero-shot/few-shot split, tech-choice justifications, CLI interface reference, evaluation-methodology deep-dive, data layer/security, real directory tree, condensed business rules, known risks, build/run/test, extension rules, measured performance). 2. Ran `evaluate.py` directly against the checked-in result CSVs to get verified, exact accuracy/calibration/era numbers rather than relying on prior prose descriptions. 3. Added two previously-undocumented, code-verified findings: the exact cause of the one JSON parse failure (unescaped quotes in a reasoning string, `SenTomCotton` row), and the measured 249/1 biden-era/trump-era-late split actually realized inside the 250-row test set itself.
