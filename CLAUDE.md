@@ -200,3 +200,55 @@ Overall accuracy: zero-shot 72.7% (181/249 valid rows, 1 parse error excluded), 
 ## 13. Update log
 
 [CLAUDE.md] Reason: full rewrite into a deep-dive reference per updated documentation requirements — every claim re-verified against source and, where possible, against actual script execution. Changes: 1. Restructured into the 13-section format (update rule, project identity, execution path incl. the zero-shot/few-shot split, tech-choice justifications, CLI interface reference, evaluation-methodology deep-dive, data layer/security, real directory tree, condensed business rules, known risks, build/run/test, extension rules, measured performance). 2. Ran `evaluate.py` directly against the checked-in result CSVs to get verified, exact accuracy/calibration/era numbers rather than relying on prior prose descriptions. 3. Added two previously-undocumented, code-verified findings: the exact cause of the one JSON parse failure (unescaped quotes in a reasoning string, `SenTomCotton` row), and the measured 249/1 biden-era/trump-era-late split actually realized inside the 250-row test set itself.
+
+[Section 14] Reason: added an interview-prep cross-check of every `resume_bullets.md` claim against the actual code and checked-in result CSVs, per request. Changes: 1. Computed exact figures directly from `llm_results_zero_shot.csv`/`llm_results_few_shot.csv` (parse-validity rate, per-bucket confidence-calibration deltas) and from the `prompts.py` old-vs-new `SYSTEM_PROMPT` (char/word reduction) rather than trusting the resume's numbers. 2. Found one claim directly contradicted by the code (the "99.3% skew" was never corrected — it's the era skew, and era was never a stratification axis) and one mechanism claimed that doesn't exist in the codebase (no automated confidence-threshold triage rule anywhere; Section 11 explicitly forbids using `confidence` as a threshold). 3. Found the resume's "99.6% parsing validity across 500 calls" actually matches the zero-shot-only rate (249/250) rather than the true 500-call rate (499/500 = 99.8%), and its "26.2-point" calibration jump matches one specific adjacent-bucket comparison in the few-shot run only, not a general below/above-85 split (which measures ~30 points).
+
+## 14. Resume claim verification
+
+Cross-checked every claim in `resume_bullets.md` against the code and the checked-in result CSVs (`llm_results_zero_shot.csv`, `llm_results_few_shot.csv`). Numbers below were computed directly with `pandas` against those two files plus the `SYSTEM_PROMPT` strings in `prompts.py`, not copied from the resume.
+
+**Bullet 1** — "Developed a stratified data-cleaning pipeline that corrected a 99.3% skew in a 179K-row dataset, creating a balanced gold evaluation set to benchmark LLM adversarial performance."
+
+|Resume claim|Codebase reality|Status|
+|---|---|---|
+|"stratified data-cleaning pipeline"|`clean_data.py:sample_balanced_test_set` (`clean_data.py:132-184`) stratifies by `party` and `is_edge_case` via four separate `.sample()` calls on disjoint pools.|✅ VERIFIED|
+|"179K-row dataset"|`clean_data.py`'s docstring year table (`clean_data.py:31-38`) sums to 18+157+126+202+801+96443+52336+29184 = 179,267 rows.|✅ VERIFIED|
+|"corrected a 99.3% skew"|179,267-row total, biden-era (2021-2023) = 96,443+52,336+29,184 = 177,963 rows = 99.27% ≈ "99.3%" — this number identifies the *era* skew documented in `clean_data.py:29-38`, not a party skew (no party-skew figure exists anywhere in the repo). But era is never a stratification axis in `sample_balanced_test_set` — only `party` and `is_edge_case` are (`clean_data.py:145-172`) — and Section 12's directly-measured era split of the actual 250-row gold set is 249/250 = 99.6% biden-era, i.e. the skew this number describes was not corrected, it survived into the final artifact at roughly the same severity.|❌ CONTRADICTED|
+|"balanced gold evaluation set"|`sample_balanced_test_set` draws exactly 100 Democrat + 100 Republican normal rows plus up to 25+25 edge rows (`clean_data.py:148-149,156-160`) — strictly 50/50 by party as the file's own docstring states (`clean_data.py:8`).|✅ VERIFIED|
+|"to benchmark LLM adversarial performance"|The `is_edge_case` flag carved out here is the same flag `evaluate.py` uses to report edge-case accuracy separately, both overall (`evaluate.py:105-116`) and per-username (`evaluate.py:121-128`) — this is exactly the adversarial-subset benchmark described.|✅ VERIFIED|
+
+**Bullet 2** — "Optimized system prompts to reduce instruction length by 80% while maintaining a strict JSON contract and 99.6% parsing validity across 500 production API calls."
+
+|Resume claim|Codebase reality|Status|
+|---|---|---|
+|"reduce instruction length by 80%"|The commented-out earlier `SYSTEM_PROMPT` (`prompts.py:27-55`) is 1,364 chars / 205 words; the live `SYSTEM_PROMPT` (`prompts.py:57-65`) is 262 chars / 36 words — an 80.8% char reduction (82.4% by word count). Matches closely.|✅ VERIFIED|
+|"strict JSON contract"|`call_api()` (`classify_llm.py:80`) does `json.loads(raw_text)` with no regex fallback; `SYSTEM_PROMPT` says "Respond ONLY with valid JSON, no other text" (`prompts.py:59`).|✅ VERIFIED|
+|"99.6% parsing validity across 500 production API calls"|Computed directly from the two result CSVs: 500 total rows (250+250), 1 `parse_error=True` row total → 499/500 = 99.8% valid, not 99.6%. The figure 99.6% instead exactly matches the zero-shot file alone: 249/250 = 0.996. The resume conflates the zero-shot-only rate with the combined 500-call sample size.|🟡 PARTIAL / IMPRECISE|
+
+**Bullet 3** — "Built a fault-tolerant LLM API client featuring a 3-tier failure-handling strategy with linear backoff on rate limits, achieving a 99.6+ valid-response rate across 500 sequential production calls without silent misclassification."
+
+|Resume claim|Codebase reality|Status|
+|---|---|---|
+|"3-tier failure-handling strategy"|`call_api()`'s `except` clauses, in fixed order: `json.JSONDecodeError` (no retry), `anthropic.RateLimitError` (retried), `anthropic.APIError` (retried) — exactly 3 tiers (`classify_llm.py:91-119`).|✅ VERIFIED|
+|"linear backoff on rate limits"|`RateLimitError` branch waits `RETRY_DELAY * attempt` seconds — 5s/10s/15s across the 3 attempts (`classify_llm.py:102-104`), a linear function of attempt number. (The generic `APIError` branch uses a flat 5s wait instead, not backoff at all — `classify_llm.py:106-109`.)|✅ VERIFIED|
+|"99.6+ valid-response rate across 500 sequential production calls"|Computed: 499/500 = 99.8% valid. 99.8 ≥ 99.6, so the "99.6+" lower-bound phrasing holds, but the true figure is a clean 99.8%, not a number near 99.6.|✅ VERIFIED (loosely — true value is 99.8%, not close to 99.6)|
+|"without silent misclassification"|`accuracy()` (`evaluate.py:29-35`) filters out `parse_error` rows entirely before scoring; a parse/API failure is counted separately and never scored as a wrong political-leaning guess (`evaluate.py:73-75`, Section 8).|✅ VERIFIED|
+
+**Bullet 4** — "Executed a controlled zero-shot versus few-shot evaluation...measuring a 5.6% relative accuracy gain overall (72.7% to 76.8%) and a 9.1% relative gain (66.0% to 72.0%) on the adversarial cross-party subset."
+
+|Resume claim|Codebase reality|Status|
+|---|---|---|
+|"controlled zero-shot versus few-shot evaluation"|Both modes run the identical 250-row test set through the identical `run_classification()`/`call_api()` machinery (`classify_llm.py:122-171`); only the prompt-building function differs (`prompts.py:120-129`) — a single-variable comparison.|✅ VERIFIED|
+|"72.7% to 76.8%" overall|Recomputed directly from the CSVs: zero-shot 181/249 = 72.7%, few-shot 192/250 = 76.8%. Exact match.|✅ VERIFIED|
+|"5.6% relative accuracy gain overall"|(76.8−72.7)/72.7 = 5.64% ≈ 5.6%. Exact match.|✅ VERIFIED|
+|"66.0% to 72.0%" on the edge-case subset|Recomputed: zero-shot edge accuracy 33/50 = 66.0%, few-shot edge accuracy 36/50 = 72.0%. Exact match.|✅ VERIFIED|
+|"9.1% relative gain...on the adversarial cross-party subset"|(72.0−66.0)/66.0 = 9.09% ≈ 9.1%. The "adversarial cross-party subset" = the `is_edge_case` rows, matching Section 1/8's own terminology. Exact match.|✅ VERIFIED|
+
+**Bullet 5** — "Built a confidence-calibration model for LLM predictions, identifying an 85% threshold that yielded a 26.2-point accuracy jump for automated triage rules."
+
+|Resume claim|Codebase reality|Status|
+|---|---|---|
+|"Built a confidence-calibration model"|`evaluate.py`'s calibration section (`evaluate.py:133-143`) is a fixed 5-bucket accuracy breakdown (`bins = [(0,50),(50,70),(70,85),(85,95),(95,101)]`, hardcoded at `evaluate.py:136`) — a descriptive report, not a fitted/trained calibration model (no regression, no reliability-curve fit, no calibration coefficients anywhere in the repo).|🟡 PARTIAL / IMPRECISE|
+|"identifying an 85% threshold"|85 is one of the pre-existing hardcoded bucket boundaries in `evaluate.py:136`, fixed before any results existed — it was not discovered/optimized from the data, and `confidence` is explicitly documented as never used as a threshold anywhere (Section 8; Section 11's do-not list).|🟡 PARTIAL / IMPRECISE|
+|"26.2-point accuracy jump"|Recomputed per-bucket accuracy from the raw CSVs: this exact figure only appears as the few-shot run's jump from the 70-84 bucket (71.0%, 76/107) to the 85-94 bucket (97.2%, 70/72) = 26.2 points. It is not a general below-85-vs-at-or-above-85 result: that comparison gives ~29.5 points for few-shot alone, ~31.8 points for zero-shot alone, and ~30.7 points combined. The same two adjacent buckets in zero-shot alone jump only 17.0 points (77.9% → 94.9%). The number is real but describes one specific two-bucket, single-mode comparison, not a general threshold effect.|🟡 PARTIAL / IMPRECISE|
+|"for automated triage rules"|No triage/routing code exists anywhere in the repo. `confidence` is read only for the calibration printout (`evaluate.py:133-143`) and the raw failure listing (`evaluate.py:156`); Section 11's do-not list states directly: "Do not use `confidence` as a filter or acceptance threshold anywhere...every place it currently appears treats it as a read-only diagnostic." No automated rule of any kind consumes `confidence`.|❌ CONTRADICTED|
