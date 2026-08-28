@@ -57,6 +57,55 @@ def print_section(title: str):
     print(f"{'─'*60}")
 
 
+CALIBRATION_BINS = [(0, 50), (50, 70), (70, 85), (85, 95), (95, 101)]
+
+
+def fit_calibration_threshold(df: pd.DataFrame, bins=CALIBRATION_BINS) -> dict:
+    """
+    Fits a simple confidence-calibration model: buckets predictions by
+    confidence, measures accuracy per bucket, then scans the boundaries
+    between adjacent buckets and picks the one with the largest accuracy
+    jump. That boundary is the triage threshold — confidence at or above
+    it is accurate often enough to auto-accept; confidence below it gets
+    routed to human review.
+    """
+    valid = df[~df["parse_error"]]
+    bucket_stats = []
+    for lo, hi in bins:
+        bucket = valid[(valid["confidence"] >= lo) & (valid["confidence"] < hi)]
+        if len(bucket) == 0:
+            continue
+        n = len(bucket)
+        c = int((bucket["pred_leaning"] == bucket["party"]).sum())
+        bucket_stats.append({"lo": lo, "hi": hi, "n": n, "accuracy": c / n})
+
+    best = None
+    for prev, cur in zip(bucket_stats, bucket_stats[1:]):
+        jump = (cur["accuracy"] - prev["accuracy"]) * 100
+        if best is None or jump > best["jump_points"]:
+            best = {
+                "threshold": cur["lo"],
+                "jump_points": jump,
+                "below_accuracy": prev["accuracy"],
+                "at_or_above_accuracy": cur["accuracy"],
+            }
+
+    return {"bucket_stats": bucket_stats, "best_jump": best}
+
+
+def apply_triage(df: pd.DataFrame, threshold: int) -> pd.DataFrame:
+    """
+    Automated triage rule built on the fitted threshold: predictions with
+    confidence >= threshold are auto-accepted; predictions below it are
+    flagged for human review before being trusted.
+    """
+    out = df.copy()
+    out["triage_action"] = out["confidence"].apply(
+        lambda c: "auto_accept" if c >= threshold else "flag_for_review"
+    )
+    return out
+
+
 # ---------------------------------------------------------------------------
 # MAIN ANALYSIS
 # ---------------------------------------------------------------------------
@@ -157,7 +206,32 @@ def analyze(df: pd.DataFrame, label: str) -> pd.DataFrame:
         print(f"  REASONING:  {row['reasoning']}")
         print()
 
-    return failures
+    # ------------------------------------------------------------------
+    # 8. Confidence-calibration model & automated triage
+    # ------------------------------------------------------------------
+    print_section("8. Confidence-Calibration Model & Automated Triage")
+    calib = fit_calibration_threshold(df)
+    for b in calib["bucket_stats"]:
+        print(f"  [{b['lo']:>3},{b['hi']:<3}): n={b['n']:>3}  accuracy={b['accuracy']:.1%}")
+
+    triage_flagged = valid.iloc[0:0]
+    best = calib["best_jump"]
+    if best:
+        print(f"\n  Fitted triage threshold: confidence >= {best['threshold']}")
+        print(f"    Below threshold accuracy:    {best['below_accuracy']:.1%}")
+        print(f"    At/above threshold accuracy: {best['at_or_above_accuracy']:.1%}")
+        print(f"    Accuracy jump at this threshold: {best['jump_points']:.1f} points")
+
+        triaged = apply_triage(valid, best["threshold"])
+        auto = triaged[triaged["triage_action"] == "auto_accept"]
+        review = triaged[triaged["triage_action"] == "flag_for_review"]
+        auto_acc = (auto["pred_leaning"] == auto["party"]).mean() if len(auto) else 0.0
+        review_acc = (review["pred_leaning"] == review["party"]).mean() if len(review) else 0.0
+        print(f"    Auto-accept:  {len(auto):>3}/{len(triaged)} ({len(auto)/len(triaged):.1%}) rows, accuracy {auto_acc:.1%}")
+        print(f"    Flag-review:  {len(review):>3}/{len(triaged)} ({len(review)/len(triaged):.1%}) rows, accuracy {review_acc:.1%}")
+        triage_flagged = review
+
+    return failures, triage_flagged
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +283,7 @@ def main():
 
     loaded = {}
     all_failures = []
+    all_triage_flagged = []
 
     for label, path in files.items():
         try:
@@ -226,9 +301,13 @@ def main():
         return
 
     for label, df in loaded.items():
-        failures = analyze(df, label)
+        failures, triage_flagged = analyze(df, label)
         failures["mode"] = label
         all_failures.append(failures)
+        if len(triage_flagged) > 0:
+            triage_flagged = triage_flagged.copy()
+            triage_flagged["mode"] = label
+            all_triage_flagged.append(triage_flagged)
 
     if len(loaded) > 1:
         comparison_table(loaded)
@@ -238,6 +317,13 @@ def main():
         failure_df = pd.concat(all_failures, ignore_index=True)
         failure_df.to_csv("failure_analysis.csv", index=False)
         print(f"\n  Failure analysis saved to failure_analysis.csv ({len(failure_df)} rows)")
+
+    # Save the automated-triage review queue (rows the calibration model
+    # flagged as below its fitted confidence threshold) for the report
+    if all_triage_flagged:
+        triage_df = pd.concat(all_triage_flagged, ignore_index=True)
+        triage_df.to_csv("triage_review_queue.csv", index=False)
+        print(f"  Triage review queue saved to triage_review_queue.csv ({len(triage_df)} rows)")
 
     print("\nDone.")
 
